@@ -52,9 +52,10 @@ func (r *Registry) registerFolderTools() {
 	// folder_delete - Delete a folder
 	r.addTool(
 		mcp.NewTool("folder_delete",
-			mcp.WithDescription("Delete a mailbox folder"),
+			mcp.WithDescription("Delete a mailbox folder. Protected folders (INBOX, Sent, Drafts, Trash, Spam) cannot be deleted. Non-empty folders require explicit confirmation."),
 			requiredString("account_id", "Account ID"),
 			requiredString("name", "Folder name to delete"),
+			optionalBool("force_if_empty", "Set to true to confirm deletion of a non-empty folder (messages will be permanently lost)"),
 		),
 		r.handleFolderDelete,
 	)
@@ -189,17 +190,47 @@ func (r *Registry) handleFolderRename(ctx context.Context, request mcp.CallToolR
 func (r *Registry) handleFolderDelete(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	accountID := request.GetString("account_id", "")
 	name := request.GetString("name", "")
+	forceEmpty := request.GetBool("force_if_empty", false)
+
+	// Protect special folders
+	protectedFolders := []string{"INBOX", "Sent", "Drafts", "Trash", "Spam", "Junk",
+		"[Gmail]/All Mail", "[Gmail]/Sent Mail", "[Gmail]/Drafts", "[Gmail]/Trash", "[Gmail]/Spam"}
+	for _, pf := range protectedFolders {
+		if name == pf {
+			return mcp.NewToolResultError(fmt.Sprintf("cannot delete protected folder '%s'", name)), nil
+		}
+	}
 
 	client, err := r.imapMgr.GetClient(accountID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get client: %v", err)), nil
 	}
 
+	// Check if folder is empty before deleting
+	info, err := client.GetFolderInfo(name)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get folder info: %v", err)), nil
+	}
+
+	if info.Messages > 0 {
+		if !forceEmpty {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"cannot delete folder '%s': folder contains %d message(s). "+
+					"Move or delete messages first, or use force_if_empty=true to confirm deletion of non-empty folder",
+				name, info.Messages)), nil
+		}
+		// User explicitly confirmed - warn them in the response
+	}
+
 	if err := client.DeleteFolder(name); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to delete folder: %v", err)), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf("Folder '%s' deleted successfully", name)), nil
+	response := fmt.Sprintf("Folder '%s' deleted successfully", name)
+	if info.Messages > 0 {
+		response = fmt.Sprintf("Folder '%s' deleted (contained %d messages which were also deleted)", name, info.Messages)
+	}
+	return mcp.NewToolResultText(response), nil
 }
 
 func (r *Registry) handleFolderSubscribe(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {

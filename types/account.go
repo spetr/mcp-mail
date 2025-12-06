@@ -18,6 +18,9 @@ type AccountConfig struct {
 	SMTPUsername string `json:"smtp_username,omitempty"` // defaults to Username
 	SMTPPassword string `json:"smtp_password,omitempty"` // defaults to Password
 	FromAddress  string `json:"from_address,omitempty"`  // defaults to Username
+
+	// Security - secret for HMAC-based safe_id generation (auto-generated)
+	Secret string `json:"secret,omitempty"`
 }
 
 // AccountStatus represents the connection status of an account

@@ -2,12 +2,63 @@ package tools
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/spetr/mcp-mail/types"
 )
+
+// generateSafeID creates an HMAC-based identifier for safe destructive operations
+// Format: hmac_hash (12 chars) - cryptographically bound to UID, from, subject, and account secret
+// This prevents AI from creating valid safe_ids without knowing the secret
+func generateSafeID(secret string, uid uint32, from string, subject string) string {
+	// Create message to sign: uid|from|subject
+	message := fmt.Sprintf("%d|%s|%s", uid, strings.ToLower(from), subject)
+
+	// Generate HMAC-SHA256
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(message))
+	hash := h.Sum(nil)
+
+	// Return first 12 hex chars (48 bits of entropy - sufficient for validation)
+	return hex.EncodeToString(hash)[:12]
+}
+
+// validateSafeID verifies that safe_id matches the actual message using HMAC
+func validateSafeID(secret string, safeID string, uid uint32, msg *types.MessageEnvelope) error {
+	if uid != msg.UID {
+		return fmt.Errorf("UID mismatch: provided %d, message has %d", uid, msg.UID)
+	}
+
+	// Get from address
+	fromAddr := ""
+	if len(msg.From) > 0 {
+		fromAddr = msg.From[0].Address
+	}
+
+	// Generate expected safe_id
+	expectedSafeID := generateSafeID(secret, msg.UID, fromAddr, msg.Subject)
+
+	if safeID != expectedSafeID {
+		return fmt.Errorf("safe_id mismatch: the provided safe_id does not match this message")
+	}
+
+	return nil
+}
+
+
+// truncate shortens a string to max length
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
 
 func (r *Registry) registerMessageTools() {
 	// message_list - List messages in a folder
@@ -47,10 +98,11 @@ func (r *Registry) registerMessageTools() {
 	// message_delete - Delete a message (moves to trash)
 	r.addTool(
 		mcp.NewTool("message_delete",
-			mcp.WithDescription("Delete a message by moving it to trash. Messages are NOT permanently deleted."),
+			mcp.WithDescription("Delete a message by moving it to trash. Requires both uid AND safe_id from message_list/message_get to prevent accidental deletion. Messages are NOT permanently deleted."),
 			requiredString("account_id", "Account ID"),
 			requiredString("folder", "Folder name"),
 			requiredNumber("uid", "Message UID"),
+			requiredString("safe_id", "Safe message identifier (HMAC token from message_list/message_get response)"),
 		),
 		r.handleMessageDelete,
 	)
@@ -58,10 +110,11 @@ func (r *Registry) registerMessageTools() {
 	// message_move - Move a message to another folder
 	r.addTool(
 		mcp.NewTool("message_move",
-			mcp.WithDescription("Move a message to another folder"),
+			mcp.WithDescription("Move a message to another folder. Requires both uid AND safe_id to prevent accidental moves."),
 			requiredString("account_id", "Account ID"),
 			requiredString("folder", "Source folder name"),
 			requiredNumber("uid", "Message UID"),
+			requiredString("safe_id", "Safe message identifier (HMAC token from message_list/message_get response)"),
 			requiredString("target_folder", "Destination folder name"),
 		),
 		r.handleMessageMove,
@@ -70,10 +123,11 @@ func (r *Registry) registerMessageTools() {
 	// message_copy - Copy a message to another folder
 	r.addTool(
 		mcp.NewTool("message_copy",
-			mcp.WithDescription("Copy a message to another folder"),
+			mcp.WithDescription("Copy a message to another folder. Requires both uid AND safe_id to ensure correct message is copied."),
 			requiredString("account_id", "Account ID"),
 			requiredString("folder", "Source folder name"),
 			requiredNumber("uid", "Message UID"),
+			requiredString("safe_id", "Safe message identifier (HMAC token from message_list/message_get response)"),
 			requiredString("target_folder", "Destination folder name"),
 		),
 		r.handleMessageCopy,
@@ -86,6 +140,12 @@ func (r *Registry) handleMessageList(ctx context.Context, request mcp.CallToolRe
 	limit := getNumber(request, "limit", 50)
 	offset := getNumber(request, "offset", 0)
 
+	// Get account secret for HMAC-based safe_id
+	secret, err := r.getAccountSecret(accountID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get account secret: %v", err)), nil
+	}
+
 	client, err := r.imapMgr.GetClient(accountID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get client: %v", err)), nil
@@ -96,12 +156,30 @@ func (r *Registry) handleMessageList(ctx context.Context, request mcp.CallToolRe
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list messages: %v", err)), nil
 	}
 
+	// Build enriched messages with safe_id for destructive operations
+	type MessageWithSafeID struct {
+		types.MessageListItem
+		SafeID string `json:"safe_id"`
+	}
+
+	enrichedMessages := make([]MessageWithSafeID, len(messages))
+	for i, msg := range messages {
+		fromAddr := ""
+		if len(msg.From) > 0 {
+			fromAddr = msg.From[0].Address
+		}
+		enrichedMessages[i] = MessageWithSafeID{
+			MessageListItem: msg,
+			SafeID:          generateSafeID(secret, msg.UID, fromAddr, msg.Subject),
+		}
+	}
+
 	// Build enriched response with memory context
 	response := map[string]interface{}{
-		"messages":   messages,
+		"messages":   enrichedMessages,
 		"account_id": accountID,
 		"folder":     folder,
-		"count":      len(messages),
+		"count":      len(enrichedMessages),
 	}
 
 	// Add memory context if available
@@ -112,7 +190,7 @@ func (r *Registry) handleMessageList(ctx context.Context, request mcp.CallToolRe
 			var importantSenders []string
 			var knownSenders []map[string]interface{}
 
-			for _, msg := range messages {
+			for _, msg := range enrichedMessages {
 				if len(msg.From) > 0 {
 					email := strings.ToLower(msg.From[0].Address)
 
@@ -162,6 +240,12 @@ func (r *Registry) handleMessageGet(ctx context.Context, request mcp.CallToolReq
 	folder := request.GetString("folder", "")
 	uid := getUint32(request, "uid", 0)
 
+	// Get account secret for HMAC-based safe_id
+	secret, err := r.getAccountSecret(accountID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get account secret: %v", err)), nil
+	}
+
 	client, err := r.imapMgr.GetClient(accountID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get client: %v", err)), nil
@@ -172,9 +256,17 @@ func (r *Registry) handleMessageGet(ctx context.Context, request mcp.CallToolReq
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get message: %v", err)), nil
 	}
 
+	// Generate safe_id for destructive operations
+	fromAddr := ""
+	if len(message.From) > 0 {
+		fromAddr = message.From[0].Address
+	}
+	safeID := generateSafeID(secret, message.UID, fromAddr, message.Subject)
+
 	// Build enriched response
 	response := map[string]interface{}{
 		"message":    message,
+		"safe_id":    safeID,
 		"account_id": accountID,
 		"folder":     folder,
 	}
@@ -320,10 +412,28 @@ func (r *Registry) handleMessageDelete(ctx context.Context, request mcp.CallTool
 	accountID := request.GetString("account_id", "")
 	folder := request.GetString("folder", "")
 	uid := getUint32(request, "uid", 0)
+	safeID := request.GetString("safe_id", "")
+
+	// Get account secret for HMAC validation
+	secret, err := r.getAccountSecret(accountID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get account secret: %v", err)), nil
+	}
 
 	client, err := r.imapMgr.GetClient(accountID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get client: %v", err)), nil
+	}
+
+	// Fetch message headers to validate safe_id
+	headers, err := client.GetMessageHeaders(folder, uid)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get message: %v", err)), nil
+	}
+
+	// Validate that safe_id matches the actual message using HMAC
+	if err := validateSafeID(secret, safeID, uid, headers); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("safety check failed: %v - the message may have changed or safe_id is incorrect", err)), nil
 	}
 
 	// Get trash folder - either from config or auto-detect
@@ -345,41 +455,95 @@ func (r *Registry) handleMessageDelete(ctx context.Context, request mcp.CallTool
 		return mcp.NewToolResultError(fmt.Sprintf("failed to move message to trash: %v", err)), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf("Message UID %d moved to trash (%s)", uid, trashFolder)), nil
+	// Return with message info for confirmation
+	fromAddr := ""
+	if len(headers.From) > 0 {
+		fromAddr = headers.From[0].Address
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Message deleted: UID %d from '%s' with subject '%s' moved to trash (%s)",
+		uid, fromAddr, truncate(headers.Subject, 50), trashFolder)), nil
 }
 
 func (r *Registry) handleMessageMove(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	accountID := request.GetString("account_id", "")
 	folder := request.GetString("folder", "")
 	uid := getUint32(request, "uid", 0)
+	safeID := request.GetString("safe_id", "")
 	targetFolder := request.GetString("target_folder", "")
+
+	// Get account secret for HMAC validation
+	secret, err := r.getAccountSecret(accountID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get account secret: %v", err)), nil
+	}
 
 	client, err := r.imapMgr.GetClient(accountID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get client: %v", err)), nil
+	}
+
+	// Fetch message headers to validate safe_id
+	headers, err := client.GetMessageHeaders(folder, uid)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get message: %v", err)), nil
+	}
+
+	// Validate that safe_id matches the actual message using HMAC
+	if err := validateSafeID(secret, safeID, uid, headers); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("safety check failed: %v - the message may have changed or safe_id is incorrect", err)), nil
 	}
 
 	if err := client.MoveMessage(folder, uid, targetFolder); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to move message: %v", err)), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf("Message UID %d moved to '%s'", uid, targetFolder)), nil
+	// Return with message info for confirmation
+	fromAddr := ""
+	if len(headers.From) > 0 {
+		fromAddr = headers.From[0].Address
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Message moved: UID %d from '%s' with subject '%s' moved to '%s'",
+		uid, fromAddr, truncate(headers.Subject, 50), targetFolder)), nil
 }
 
 func (r *Registry) handleMessageCopy(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	accountID := request.GetString("account_id", "")
 	folder := request.GetString("folder", "")
 	uid := getUint32(request, "uid", 0)
+	safeID := request.GetString("safe_id", "")
 	targetFolder := request.GetString("target_folder", "")
+
+	// Get account secret for HMAC validation
+	secret, err := r.getAccountSecret(accountID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get account secret: %v", err)), nil
+	}
 
 	client, err := r.imapMgr.GetClient(accountID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get client: %v", err)), nil
 	}
 
+	// Fetch message headers to validate safe_id
+	headers, err := client.GetMessageHeaders(folder, uid)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get message: %v", err)), nil
+	}
+
+	// Validate that safe_id matches the actual message using HMAC
+	if err := validateSafeID(secret, safeID, uid, headers); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("safety check failed: %v - the message may have changed or safe_id is incorrect", err)), nil
+	}
+
 	if err := client.CopyMessage(folder, uid, targetFolder); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to copy message: %v", err)), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf("Message UID %d copied to '%s'", uid, targetFolder)), nil
+	// Return with message info for confirmation
+	fromAddr := ""
+	if len(headers.From) > 0 {
+		fromAddr = headers.From[0].Address
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Message copied: UID %d from '%s' with subject '%s' copied to '%s'",
+		uid, fromAddr, truncate(headers.Subject, 50), targetFolder)), nil
 }

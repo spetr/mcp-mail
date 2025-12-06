@@ -2,12 +2,23 @@ package tools
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
-	"github.com/spetr/mcp-mail/types"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/spetr/mcp-mail/types"
 )
+
+// generateAccountSecret generates a random 32-byte secret for HMAC-based safe_id
+func generateAccountSecret() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(bytes), nil
+}
 
 func (r *Registry) registerAccountTools() {
 	// account_list - List all configured accounts
@@ -162,6 +173,12 @@ func (r *Registry) handleAccountAdd(ctx context.Context, request mcp.CallToolReq
 	username := request.GetString("username", "")
 	password := request.GetString("password", "")
 
+	// Generate secret for HMAC-based safe_id
+	secret, err := generateAccountSecret()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to generate account secret: %v", err)), nil
+	}
+
 	account := types.AccountConfig{
 		ID:       id,
 		Name:     name,
@@ -170,6 +187,7 @@ func (r *Registry) handleAccountAdd(ctx context.Context, request mcp.CallToolReq
 		TLS:      tls,
 		Username: username,
 		Password: password,
+		Secret:   secret,
 	}
 
 	if err := r.configMgr.AddAccount(account); err != nil {

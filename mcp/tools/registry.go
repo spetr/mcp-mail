@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"fmt"
 	"log"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -114,4 +115,32 @@ func requiredNumber(name, description string) mcp.ToolOption {
 // Helper function to create an optional boolean parameter
 func optionalBool(name, description string) mcp.ToolOption {
 	return mcp.WithBoolean(name, mcp.Description(description))
+}
+
+// getAccountSecret returns the HMAC secret for an account
+// If account has no secret (legacy), generates and saves one
+func (r *Registry) getAccountSecret(accountID string) (string, error) {
+	account, ok := r.configMgr.GetAccount(accountID)
+	if !ok {
+		return "", fmt.Errorf("account '%s' not found", accountID)
+	}
+
+	// If account has no secret (legacy account), generate one
+	if account.Secret == "" {
+		secret, err := generateAccountSecret()
+		if err != nil {
+			return "", fmt.Errorf("failed to generate secret: %v", err)
+		}
+		account.Secret = secret
+
+		// Update account with new secret
+		if err := r.configMgr.UpdateAccount(account); err != nil {
+			return "", fmt.Errorf("failed to save secret: %v", err)
+		}
+		if err := r.configMgr.Save(); err != nil {
+			log.Printf("Warning: Failed to persist account secret: %v", err)
+		}
+	}
+
+	return account.Secret, nil
 }
