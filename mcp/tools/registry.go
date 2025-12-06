@@ -3,12 +3,13 @@ package tools
 import (
 	"log"
 
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/spetr/mcp-mail/config"
 	"github.com/spetr/mcp-mail/imap"
 	"github.com/spetr/mcp-mail/memory"
 	"github.com/spetr/mcp-mail/security"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	"github.com/spetr/mcp-mail/smtp"
 )
 
 // maxBulkOperations is the maximum number of UIDs allowed per bulk operation
@@ -25,8 +26,12 @@ type Registry struct {
 	configMgr  *config.Manager
 	imapMgr    *imap.Manager
 	memoryMgr  *memory.Manager
+	smtpMgr    *smtp.Manager
 	protectMgr *security.ProtectionManager
 	tools      []Tool
+
+	// Track current active account for context switching detection
+	currentAccountID string
 }
 
 // NewRegistry creates a new tool registry
@@ -43,15 +48,20 @@ func NewRegistry(configMgr *config.Manager, imapMgr *imap.Manager) *Registry {
 		memMgr = nil
 	}
 
+	// Create SMTP manager
+	smtpMgr := smtp.NewManager(configMgr)
+
 	r := &Registry{
 		configMgr:  configMgr,
 		imapMgr:    imapMgr,
 		memoryMgr:  memMgr,
+		smtpMgr:    smtpMgr,
 		protectMgr: security.NewProtectionManager(&cfg.Security),
 		tools:      make([]Tool, 0),
 	}
 
 	// Register all tools
+	r.registerInstructionTools()
 	r.registerAccountTools()
 	r.registerFolderTools()
 	r.registerMessageTools()
@@ -59,8 +69,10 @@ func NewRegistry(configMgr *config.Manager, imapMgr *imap.Manager) *Registry {
 	r.registerFlagTools()
 	r.registerSearchTools()
 	r.registerBulkTools()
+	r.registerSendTools()
 	if memMgr != nil {
 		r.registerMemoryTools()
+		r.registerAnalyzeTools()
 	}
 
 	return r

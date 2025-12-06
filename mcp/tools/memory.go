@@ -111,12 +111,15 @@ func (r *Registry) registerMemoryTools() {
 	// memory_update_preferences - Update preferences
 	r.addTool(
 		mcp.NewTool("memory_update_preferences",
-			mcp.WithDescription("Update user preferences for this account."),
+			mcp.WithDescription("Update user preferences for this account including analysis settings."),
 			requiredString("account_id", "Account ID"),
 			optionalString("language", "Preferred language (e.g., 'cs', 'en')"),
 			optionalString("summary_style", "Summary style: 'brief', 'detailed', 'bullet_points'"),
 			optionalString("timezone", "Timezone for dates"),
 			optionalString("default_folder", "Default folder to check"),
+			optionalNumber("analysis_depth", "Max messages to analyze (default 1000)"),
+			optionalNumber("analysis_period", "Days to look back for analysis (default 180)"),
+			optionalBool("hints_enabled", "Enable/disable hints in responses (default true)"),
 		),
 		r.handleMemoryUpdatePreferences,
 	)
@@ -161,6 +164,98 @@ func (r *Registry) registerMemoryTools() {
 			requiredString("email", "Contact email address"),
 		),
 		r.handleMemoryGetContact,
+	)
+
+	// =========================================================================
+	// Profile Tools
+	// =========================================================================
+
+	// memory_update_profile - Update account profile
+	r.addTool(
+		mcp.NewTool("memory_update_profile",
+			mcp.WithDescription("Update the account profile. Use this to describe the account type, purpose, and activity patterns as you learn about the user's email habits."),
+			requiredString("account_id", "Account ID"),
+			optionalString("type", "Account type: 'personal', 'work', 'mixed', 'newsletters'"),
+			optionalString("description", "AI-generated description of the account and its purpose"),
+			optionalString("activity_summary", "Summary of user's email activity patterns (e.g., 'Aktivní večer, odpovídá do 24h')"),
+		),
+		r.handleMemoryUpdateProfile,
+	)
+
+	// memory_set_sender - Set sender profile/classification
+	r.addTool(
+		mcp.NewTool("memory_set_sender",
+			mcp.WithDescription("Classify a sender. Use this to mark senders as important, newsletters, or to ignore. The system tracks statistics (response rate, frequency) automatically."),
+			requiredString("account_id", "Account ID"),
+			requiredString("email", "Sender email address"),
+			optionalString("name", "Sender name"),
+			optionalString("type", "Sender type: 'person', 'newsletter', 'notification', 'service'"),
+			optionalString("importance", "Importance level: 'high', 'normal', 'low', 'ignore'"),
+			optionalString("relationship", "Relationship: 'colleague', 'family', 'friend', 'vendor', 'support'"),
+			optionalString("notes", "Notes about this sender"),
+		),
+		r.handleMemorySetSender,
+	)
+
+	// memory_get_sender - Get sender profile with stats
+	r.addTool(
+		mcp.NewTool("memory_get_sender",
+			mcp.WithDescription("Get profile and statistics for a specific sender. Shows classification, response rate, and email frequency."),
+			requiredString("account_id", "Account ID"),
+			requiredString("email", "Sender email address"),
+		),
+		r.handleMemoryGetSender,
+	)
+
+	// memory_remove_sender - Remove sender profile
+	r.addTool(
+		mcp.NewTool("memory_remove_sender",
+			mcp.WithDescription("Remove a sender profile (classification and stats)."),
+			requiredString("account_id", "Account ID"),
+			requiredString("email", "Sender email address"),
+		),
+		r.handleMemoryRemoveSender,
+	)
+
+	// memory_add_rule - Add importance rule
+	r.addTool(
+		mcp.NewTool("memory_add_rule",
+			mcp.WithDescription("Add a rule for determining email importance. Rules are patterns that match emails and assign actions."),
+			requiredString("account_id", "Account ID"),
+			requiredString("pattern", "Match pattern: 'from:*@company.com', 'subject:urgent', 'to:team@*'"),
+			requiredString("action", "Action: 'high_priority', 'needs_response', 'normal', 'low_priority', 'ignore'"),
+			optionalString("reason", "Explanation why this rule exists"),
+			optionalNumber("confidence", "Confidence level 0-100 (default 80)"),
+		),
+		r.handleMemoryAddRule,
+	)
+
+	// memory_remove_rule - Remove importance rule
+	r.addTool(
+		mcp.NewTool("memory_remove_rule",
+			mcp.WithDescription("Remove an importance rule by its pattern."),
+			requiredString("account_id", "Account ID"),
+			requiredString("pattern", "Pattern to remove"),
+		),
+		r.handleMemoryRemoveRule,
+	)
+
+	// memory_prune - Clean up stale memory data
+	r.addTool(
+		mcp.NewTool("memory_prune",
+			mcp.WithDescription("Clean up stale/unimportant data from memory. Removes sender profiles that have no classification, low activity (<3 emails), and haven't been seen in 90+ days. Use this when memory gets too large."),
+			requiredString("account_id", "Account ID"),
+		),
+		r.handleMemoryPrune,
+	)
+
+	// memory_stats - Get memory statistics
+	r.addTool(
+		mcp.NewTool("memory_stats",
+			mcp.WithDescription("Get statistics about memory size (sender count, notes, rules, etc). Use this to check if memory needs pruning."),
+			requiredString("account_id", "Account ID"),
+		),
+		r.handleMemoryStats,
 	)
 }
 
@@ -350,15 +445,43 @@ func (r *Registry) handleMemoryUpdatePreferences(ctx context.Context, request mc
 	summaryStyle := request.GetString("summary_style", "")
 	timezone := request.GetString("timezone", "")
 	defaultFolder := request.GetString("default_folder", "")
+	analysisDepth := request.GetInt("analysis_depth", 0)
+	analysisPeriod := request.GetInt("analysis_period", 0)
 
-	prefs := memory.Preferences{
-		Language:      language,
-		SummaryStyle:  summaryStyle,
-		Timezone:      timezone,
-		DefaultFolder: defaultFolder,
+	// Check if hints_enabled was explicitly provided
+	var hintsEnabled *bool
+	if args, ok := request.Params.Arguments.(map[string]interface{}); ok {
+		if _, exists := args["hints_enabled"]; exists {
+			val := request.GetBool("hints_enabled", true)
+			hintsEnabled = &val
+		}
 	}
 
-	if err := r.memoryMgr.UpdatePreferences(accountID, prefs); err != nil {
+	err := r.memoryMgr.Update(accountID, func(mem *memory.AccountMemory) {
+		if language != "" {
+			mem.Preferences.Language = language
+		}
+		if summaryStyle != "" {
+			mem.Preferences.SummaryStyle = summaryStyle
+		}
+		if timezone != "" {
+			mem.Preferences.Timezone = timezone
+		}
+		if defaultFolder != "" {
+			mem.Preferences.DefaultFolder = defaultFolder
+		}
+		if analysisDepth > 0 {
+			mem.Preferences.AnalysisDepth = analysisDepth
+		}
+		if analysisPeriod > 0 {
+			mem.Preferences.AnalysisPeriod = analysisPeriod
+		}
+		if hintsEnabled != nil {
+			mem.Preferences.HintsEnabled = hintsEnabled
+		}
+	})
+
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to update preferences: %v", err)), nil
 	}
 
@@ -421,4 +544,160 @@ func (r *Registry) handleMemoryGetContact(ctx context.Context, request mcp.CallT
 
 	resultJSON, _ := json.Marshal(contact)
 	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+// ============================================================================
+// Profile Tools
+// ============================================================================
+
+func (r *Registry) handleMemoryUpdateProfile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+	profileType := request.GetString("type", "")
+	description := request.GetString("description", "")
+	activitySummary := request.GetString("activity_summary", "")
+
+	if profileType == "" && description == "" && activitySummary == "" {
+		return mcp.NewToolResultError("at least one of type, description, or activity_summary is required"), nil
+	}
+
+	if err := r.memoryMgr.UpdateProfile(accountID, profileType, description, activitySummary); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to update profile: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Profile updated for account '%s'", accountID)), nil
+}
+
+func (r *Registry) handleMemorySetSender(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+	email := request.GetString("email", "")
+	name := request.GetString("name", "")
+	senderType := request.GetString("type", "")
+	importance := request.GetString("importance", "")
+	relationship := request.GetString("relationship", "")
+	notes := request.GetString("notes", "")
+
+	if email == "" {
+		return mcp.NewToolResultError("email is required"), nil
+	}
+
+	profile := &memory.SenderProfile{
+		Email:        email,
+		Name:         name,
+		Type:         senderType,
+		Importance:   importance,
+		Relationship: relationship,
+		Notes:        notes,
+	}
+
+	if err := r.memoryMgr.SetSenderProfile(accountID, profile); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to set sender profile: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Sender profile updated for '%s'", email)), nil
+}
+
+func (r *Registry) handleMemoryGetSender(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+	email := request.GetString("email", "")
+
+	if email == "" {
+		return mcp.NewToolResultError("email is required"), nil
+	}
+
+	profile, err := r.memoryMgr.GetSenderProfile(accountID, email)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("sender not found: %v", err)), nil
+	}
+
+	resultJSON, _ := json.Marshal(profile)
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+func (r *Registry) handleMemoryRemoveSender(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+	email := request.GetString("email", "")
+
+	if email == "" {
+		return mcp.NewToolResultError("email is required"), nil
+	}
+
+	if err := r.memoryMgr.RemoveSenderProfile(accountID, email); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to remove sender: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Sender profile removed for '%s'", email)), nil
+}
+
+func (r *Registry) handleMemoryAddRule(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+	pattern := request.GetString("pattern", "")
+	action := request.GetString("action", "")
+	reason := request.GetString("reason", "")
+	confidence := request.GetInt("confidence", 80)
+
+	if pattern == "" {
+		return mcp.NewToolResultError("pattern is required (e.g., 'from:*@company.com', 'subject:urgent')"), nil
+	}
+	if action == "" {
+		return mcp.NewToolResultError("action is required (high_priority, needs_response, normal, low_priority, ignore)"), nil
+	}
+
+	rule := memory.ImportanceRule{
+		Pattern:     pattern,
+		Action:      action,
+		Reason:      reason,
+		Confidence:  confidence,
+		LearnedFrom: "manual",
+	}
+
+	if err := r.memoryMgr.AddImportanceRule(accountID, rule); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to add rule: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Importance rule added: %s → %s", pattern, action)), nil
+}
+
+func (r *Registry) handleMemoryRemoveRule(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+	pattern := request.GetString("pattern", "")
+
+	if pattern == "" {
+		return mcp.NewToolResultError("pattern is required"), nil
+	}
+
+	if err := r.memoryMgr.RemoveImportanceRule(accountID, pattern); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to remove rule: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Importance rule removed: %s", pattern)), nil
+}
+
+func (r *Registry) handleMemoryPrune(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+
+	var pruneResult memory.PruneResult
+
+	err := r.memoryMgr.Update(accountID, func(mem *memory.AccountMemory) {
+		pruneResult = mem.Prune()
+	})
+
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to prune memory: %v", err)), nil
+	}
+
+	result, _ := json.Marshal(pruneResult)
+	return mcp.NewToolResultText(string(result)), nil
+}
+
+func (r *Registry) handleMemoryStats(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	accountID := request.GetString("account_id", "")
+
+	mem, err := r.memoryMgr.GetOrLoad(accountID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get memory: %v", err)), nil
+	}
+
+	stats := mem.GetMemoryStats()
+	result, _ := json.Marshal(stats)
+	return mcp.NewToolResultText(string(result)), nil
 }

@@ -77,9 +77,9 @@ func TestLoadAndSave(t *testing.T) {
 		t.Errorf("expected AccountID %s, got %s", accountID, mem.AccountID)
 	}
 
-	// Modify and save
+	// Modify and save immediately (using SaveNow for tests)
 	mem.Preferences.Language = "en"
-	if err := mgr.Save(accountID); err != nil {
+	if err := mgr.SaveNow(accountID); err != nil {
 		t.Fatalf("failed to save: %v", err)
 	}
 
@@ -432,11 +432,11 @@ func TestListAccounts(t *testing.T) {
 
 	mgr, _ := NewManager(tempDir)
 
-	// Create some accounts
+	// Create some accounts (use SaveNow for immediate persistence in tests)
 	mgr.Load("account1")
-	mgr.Save("account1")
+	mgr.SaveNow("account1")
 	mgr.Load("account2")
-	mgr.Save("account2")
+	mgr.SaveNow("account2")
 
 	accounts, err := mgr.List()
 	if err != nil {
@@ -457,9 +457,9 @@ func TestDelete(t *testing.T) {
 	mgr, _ := NewManager(tempDir)
 	accountID := "test-account"
 
-	// Create and save
+	// Create and save immediately (use SaveNow for tests)
 	mgr.Load(accountID)
-	mgr.Save(accountID)
+	mgr.SaveNow(accountID)
 
 	// Verify file exists
 	filePath := filepath.Join(tempDir, accountID+".json")

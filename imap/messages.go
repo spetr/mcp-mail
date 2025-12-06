@@ -259,6 +259,92 @@ func (c *Client) GetMessageHeaders(folder string, uid uint32) (*types.MessageEnv
 	return result, nil
 }
 
+// GetMessageHeadersBatch returns headers for multiple messages by UIDs
+// This is more efficient than calling GetMessageHeaders multiple times
+func (c *Client) GetMessageHeadersBatch(folder string, uids []uint32) ([]*types.MessageEnvelope, error) {
+	if len(uids) == 0 {
+		return []*types.MessageEnvelope{}, nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.ensureConnected(); err != nil {
+		return nil, err
+	}
+
+	if err := c.selectFolder(folder); err != nil {
+		return nil, err
+	}
+
+	// Build UID set from all UIDs
+	var uidSet imap.UIDSet
+	for _, uid := range uids {
+		uidSet.AddNum(imap.UID(uid))
+	}
+
+	fetchOpts := &imap.FetchOptions{
+		UID:        true,
+		Flags:      true,
+		Envelope:   true,
+		RFC822Size: true,
+	}
+
+	fetchCmd := c.client.Fetch(uidSet, fetchOpts)
+	defer fetchCmd.Close()
+
+	// Collect results in a map for fast lookup
+	results := make(map[uint32]*types.MessageEnvelope)
+
+	for {
+		msg := fetchCmd.Next()
+		if msg == nil {
+			break
+		}
+
+		buf, err := msg.Collect()
+		if err != nil {
+			continue // Skip failed messages
+		}
+
+		result := &types.MessageEnvelope{
+			UID:   uint32(buf.UID),
+			Flags: convertFlags(buf.Flags),
+			Size:  uint32(buf.RFC822Size),
+		}
+
+		if buf.Envelope != nil {
+			result.Subject = buf.Envelope.Subject
+			result.Date = buf.Envelope.Date
+			result.MessageID = buf.Envelope.MessageID
+			if len(buf.Envelope.InReplyTo) > 0 {
+				result.InReplyTo = buf.Envelope.InReplyTo[0]
+			}
+			result.From = convertAddresses(buf.Envelope.From)
+			result.To = convertAddresses(buf.Envelope.To)
+			result.Cc = convertAddresses(buf.Envelope.Cc)
+			result.Bcc = convertAddresses(buf.Envelope.Bcc)
+			result.ReplyTo = convertAddresses(buf.Envelope.ReplyTo)
+		}
+
+		results[uint32(buf.UID)] = result
+	}
+
+	if err := fetchCmd.Close(); err != nil {
+		return nil, fmt.Errorf("fetch error: %w", err)
+	}
+
+	// Return results in the same order as requested UIDs
+	ordered := make([]*types.MessageEnvelope, 0, len(uids))
+	for _, uid := range uids {
+		if env, ok := results[uid]; ok {
+			ordered = append(ordered, env)
+		}
+	}
+
+	return ordered, nil
+}
+
 // DeleteMessage deletes a message by UID
 func (c *Client) DeleteMessage(folder string, uid uint32, permanent bool) error {
 	c.mu.Lock()

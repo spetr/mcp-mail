@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,6 +15,16 @@ type Manager struct {
 	mu        sync.RWMutex
 	memories  map[string]*AccountMemory
 	directory string
+
+	// Deduplication: track seen message UIDs per session to avoid duplicate counts
+	// Key is "accountID:folder:uid"
+	seenMessages map[string]bool
+	seenMu       sync.RWMutex
+
+	// Async save: track dirty accounts
+	dirtyAccounts map[string]bool
+	dirtyMu       sync.Mutex
+	saveChan      chan struct{}
 }
 
 // NewManager creates a new memory manager
@@ -32,10 +43,39 @@ func NewManager(directory string) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create memory directory: %w", err)
 	}
 
-	return &Manager{
-		memories:  make(map[string]*AccountMemory),
-		directory: directory,
-	}, nil
+	m := &Manager{
+		memories:      make(map[string]*AccountMemory),
+		directory:     directory,
+		seenMessages:  make(map[string]bool),
+		dirtyAccounts: make(map[string]bool),
+		saveChan:      make(chan struct{}, 1),
+	}
+
+	// Start background save goroutine
+	go m.backgroundSaver()
+
+	return m, nil
+}
+
+// backgroundSaver handles async saves
+func (m *Manager) backgroundSaver() {
+	for range m.saveChan {
+		m.Flush()
+	}
+}
+
+// markDirty marks an account as needing to be saved
+func (m *Manager) markDirty(accountID string) {
+	m.dirtyMu.Lock()
+	m.dirtyAccounts[accountID] = true
+	m.dirtyMu.Unlock()
+
+	// Trigger save (non-blocking)
+	select {
+	case m.saveChan <- struct{}{}:
+	default:
+		// Already scheduled
+	}
 }
 
 // GetDirectory returns the memory storage directory
@@ -76,8 +116,22 @@ func (m *Manager) Load(accountID string) (*AccountMemory, error) {
 	return &mem, nil
 }
 
-// Save saves memory for an account to disk
+// Save saves memory for an account to disk (async)
 func (m *Manager) Save(accountID string) error {
+	m.mu.RLock()
+	_, ok := m.memories[accountID]
+	m.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("memory for account '%s' not loaded", accountID)
+	}
+
+	m.markDirty(accountID)
+	return nil
+}
+
+// SaveNow saves memory immediately (use for critical updates)
+func (m *Manager) SaveNow(accountID string) error {
 	m.mu.RLock()
 	mem, ok := m.memories[accountID]
 	m.mu.RUnlock()
@@ -86,7 +140,28 @@ func (m *Manager) Save(accountID string) error {
 		return fmt.Errorf("memory for account '%s' not loaded", accountID)
 	}
 
-	// Update last modified time
+	return m.writeToDisk(accountID, mem)
+}
+
+// Flush saves all dirty accounts immediately
+func (m *Manager) Flush() {
+	m.dirtyMu.Lock()
+	toSave := m.dirtyAccounts
+	m.dirtyAccounts = make(map[string]bool)
+	m.dirtyMu.Unlock()
+
+	for accountID := range toSave {
+		m.mu.RLock()
+		mem, ok := m.memories[accountID]
+		m.mu.RUnlock()
+		if ok {
+			m.writeToDisk(accountID, mem)
+		}
+	}
+}
+
+// writeToDisk writes memory to disk
+func (m *Manager) writeToDisk(accountID string, mem *AccountMemory) error {
 	mem.LastUpdated = time.Now()
 
 	data, err := json.MarshalIndent(mem, "", "  ")
@@ -372,4 +447,325 @@ func (m *Manager) GetContact(accountID, email string) (*Contact, error) {
 		}
 	}
 	return nil, fmt.Errorf("contact '%s' not found", email)
+}
+
+// ============================================================================
+// Profile Management
+// ============================================================================
+
+// TrackMessageSeen records that a message from a sender was seen
+// This is called passively during message_list, message_get, search operations
+// Uses deduplication to avoid counting same message multiple times
+func (m *Manager) TrackMessageSeen(accountID, from string, flags []string) error {
+	if from == "" {
+		return nil
+	}
+
+	// Extract email from "Name <email>" format
+	email := extractEmail(from)
+	if email == "" {
+		return nil
+	}
+
+	return m.Update(accountID, func(mem *AccountMemory) {
+		if mem.Profile.SenderProfiles == nil {
+			mem.Profile.SenderProfiles = make(map[string]*SenderProfile)
+		}
+
+		sp, exists := mem.Profile.SenderProfiles[email]
+		if !exists {
+			sp = &SenderProfile{
+				Email: email,
+				Name:  extractName(from),
+				Stats: SenderStats{
+					FirstSeen: time.Now(),
+				},
+			}
+			mem.Profile.SenderProfiles[email] = sp
+		}
+
+		sp.Stats.TotalSeen++
+		sp.Stats.LastSeen = time.Now()
+
+		// Check for flags
+		for _, flag := range flags {
+			switch flag {
+			case "\\Answered":
+				sp.Stats.TotalAnswered++
+			case "\\Flagged":
+				sp.Stats.TotalFlagged++
+			}
+		}
+	})
+}
+
+// TrackMessageSeenWithUID records message seen with deduplication by UID
+// This prevents counting the same message multiple times in a session
+func (m *Manager) TrackMessageSeenWithUID(accountID, folder string, uid uint32, from string, flags []string) error {
+	if from == "" {
+		return nil
+	}
+
+	// Check for deduplication
+	dedupKey := fmt.Sprintf("%s:%s:%d", accountID, folder, uid)
+	m.seenMu.RLock()
+	alreadySeen := m.seenMessages[dedupKey]
+	m.seenMu.RUnlock()
+
+	if alreadySeen {
+		// Already tracked this message, skip
+		return nil
+	}
+
+	// Mark as seen
+	m.seenMu.Lock()
+	m.seenMessages[dedupKey] = true
+	m.seenMu.Unlock()
+
+	// Extract email from "Name <email>" format
+	email := extractEmail(from)
+	if email == "" {
+		return nil
+	}
+
+	return m.Update(accountID, func(mem *AccountMemory) {
+		if mem.Profile.SenderProfiles == nil {
+			mem.Profile.SenderProfiles = make(map[string]*SenderProfile)
+		}
+
+		sp, exists := mem.Profile.SenderProfiles[email]
+		if !exists {
+			sp = &SenderProfile{
+				Email: email,
+				Name:  extractName(from),
+				Stats: SenderStats{
+					FirstSeen: time.Now(),
+				},
+			}
+			mem.Profile.SenderProfiles[email] = sp
+		}
+
+		sp.Stats.TotalSeen++
+		sp.Stats.LastSeen = time.Now()
+
+		// Check for flags - only count once per message
+		for _, flag := range flags {
+			switch flag {
+			case "\\Answered":
+				sp.Stats.TotalAnswered++
+			case "\\Flagged":
+				sp.Stats.TotalFlagged++
+			}
+		}
+	})
+}
+
+// ClearSeenCache clears the deduplication cache (call at session start)
+func (m *Manager) ClearSeenCache() {
+	m.seenMu.Lock()
+	m.seenMessages = make(map[string]bool)
+	m.seenMu.Unlock()
+}
+
+// TrackMessageAnswered records that user replied to a message from sender
+// This is called when message_reply is used
+func (m *Manager) TrackMessageAnswered(accountID, from string) error {
+	if from == "" {
+		return nil
+	}
+
+	email := extractEmail(from)
+	if email == "" {
+		return nil
+	}
+
+	return m.Update(accountID, func(mem *AccountMemory) {
+		if mem.Profile.SenderProfiles == nil {
+			mem.Profile.SenderProfiles = make(map[string]*SenderProfile)
+		}
+
+		sp, exists := mem.Profile.SenderProfiles[email]
+		if !exists {
+			sp = &SenderProfile{
+				Email: email,
+				Name:  extractName(from),
+				Stats: SenderStats{
+					FirstSeen: time.Now(),
+				},
+			}
+			mem.Profile.SenderProfiles[email] = sp
+		}
+
+		sp.Stats.TotalAnswered++
+		sp.Stats.LastSeen = time.Now()
+	})
+}
+
+// GetSenderProfile returns profile for a specific sender
+func (m *Manager) GetSenderProfile(accountID, email string) (*SenderProfile, error) {
+	mem, err := m.GetOrLoad(accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	if mem.Profile.SenderProfiles == nil {
+		return nil, fmt.Errorf("sender '%s' not found", email)
+	}
+
+	sp, exists := mem.Profile.SenderProfiles[email]
+	if !exists {
+		return nil, fmt.Errorf("sender '%s' not found", email)
+	}
+
+	return sp, nil
+}
+
+// SetSenderProfile sets or updates profile for a sender
+func (m *Manager) SetSenderProfile(accountID string, profile *SenderProfile) error {
+	if profile.Email == "" {
+		return fmt.Errorf("email is required")
+	}
+
+	return m.Update(accountID, func(mem *AccountMemory) {
+		if mem.Profile.SenderProfiles == nil {
+			mem.Profile.SenderProfiles = make(map[string]*SenderProfile)
+		}
+
+		existing, exists := mem.Profile.SenderProfiles[profile.Email]
+		if exists {
+			// Preserve stats when updating
+			if profile.Name != "" {
+				existing.Name = profile.Name
+			}
+			if profile.Type != "" {
+				existing.Type = profile.Type
+			}
+			if profile.Importance != "" {
+				existing.Importance = profile.Importance
+			}
+			if profile.Relationship != "" {
+				existing.Relationship = profile.Relationship
+			}
+			if profile.Notes != "" {
+				existing.Notes = profile.Notes
+			}
+		} else {
+			if profile.Stats.FirstSeen.IsZero() {
+				profile.Stats.FirstSeen = time.Now()
+			}
+			mem.Profile.SenderProfiles[profile.Email] = profile
+		}
+	})
+}
+
+// RemoveSenderProfile removes a sender profile
+func (m *Manager) RemoveSenderProfile(accountID, email string) error {
+	return m.Update(accountID, func(mem *AccountMemory) {
+		if mem.Profile.SenderProfiles != nil {
+			delete(mem.Profile.SenderProfiles, email)
+		}
+	})
+}
+
+// AddImportanceRule adds or updates an importance rule
+func (m *Manager) AddImportanceRule(accountID string, rule ImportanceRule) error {
+	if rule.Pattern == "" {
+		return fmt.Errorf("pattern is required")
+	}
+	if rule.Action == "" {
+		return fmt.Errorf("action is required")
+	}
+
+	return m.Update(accountID, func(mem *AccountMemory) {
+		// Check if rule with same pattern exists
+		for i, r := range mem.Profile.ImportanceRules {
+			if r.Pattern == rule.Pattern {
+				mem.Profile.ImportanceRules[i] = rule
+				return
+			}
+		}
+		mem.Profile.ImportanceRules = append(mem.Profile.ImportanceRules, rule)
+	})
+}
+
+// RemoveImportanceRule removes a rule by pattern
+func (m *Manager) RemoveImportanceRule(accountID, pattern string) error {
+	return m.Update(accountID, func(mem *AccountMemory) {
+		for i, r := range mem.Profile.ImportanceRules {
+			if r.Pattern == pattern {
+				mem.Profile.ImportanceRules = append(
+					mem.Profile.ImportanceRules[:i],
+					mem.Profile.ImportanceRules[i+1:]...,
+				)
+				return
+			}
+		}
+	})
+}
+
+// UpdateProfile updates the account profile metadata
+func (m *Manager) UpdateProfile(accountID string, profileType, description, activitySummary string) error {
+	return m.Update(accountID, func(mem *AccountMemory) {
+		if profileType != "" {
+			mem.Profile.Type = profileType
+		}
+		if description != "" {
+			mem.Profile.Description = description
+		}
+		if activitySummary != "" {
+			mem.Profile.ActivitySummary = activitySummary
+		}
+	})
+}
+
+// SetProfileAnalyzed marks the profile as analyzed
+func (m *Manager) SetProfileAnalyzed(accountID string, count int) error {
+	return m.Update(accountID, func(mem *AccountMemory) {
+		mem.Profile.LastAnalyzed = time.Now()
+		mem.Profile.AnalyzedCount = count
+	})
+}
+
+// GetAnalysisPreferences returns analysis preferences with defaults
+func (m *Manager) GetAnalysisPreferences(accountID string) (depth int, period int, err error) {
+	mem, err := m.GetOrLoad(accountID)
+	if err != nil {
+		return 1000, 180, err
+	}
+
+	depth = mem.Preferences.AnalysisDepth
+	if depth <= 0 {
+		depth = 1000
+	}
+
+	period = mem.Preferences.AnalysisPeriod
+	if period <= 0 {
+		period = 180
+	}
+
+	return depth, period, nil
+}
+
+// Helper functions
+
+func extractEmail(from string) string {
+	// Handle "Name <email@domain.com>" format
+	if start := strings.Index(from, "<"); start != -1 {
+		if end := strings.Index(from, ">"); end > start {
+			return strings.TrimSpace(from[start+1 : end])
+		}
+	}
+	// Assume it's just an email
+	return strings.TrimSpace(from)
+}
+
+func extractName(from string) string {
+	// Handle "Name <email@domain.com>" format
+	if start := strings.Index(from, "<"); start > 0 {
+		name := strings.TrimSpace(from[:start])
+		// Remove quotes if present
+		name = strings.Trim(name, "\"'")
+		return name
+	}
+	return ""
 }

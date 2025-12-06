@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -95,7 +96,60 @@ func (r *Registry) handleMessageList(ctx context.Context, request mcp.CallToolRe
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list messages: %v", err)), nil
 	}
 
-	result, err := json.Marshal(messages)
+	// Build enriched response with memory context
+	response := map[string]interface{}{
+		"messages":   messages,
+		"account_id": accountID,
+		"folder":     folder,
+		"count":      len(messages),
+	}
+
+	// Add memory context if available
+	if r.memoryMgr != nil {
+		mem, err := r.memoryMgr.GetOrLoad(accountID)
+		if err == nil {
+			// Find important/known senders in this list
+			var importantSenders []string
+			var knownSenders []map[string]interface{}
+
+			for _, msg := range messages {
+				if len(msg.From) > 0 {
+					email := strings.ToLower(msg.From[0].Address)
+
+					// Check if sender is in important contacts
+					for _, contact := range mem.ImportantContacts {
+						if strings.ToLower(contact.Email) == email {
+							importantSenders = append(importantSenders, fmt.Sprintf("%s (%s)", email, contact.Role))
+							break
+						}
+					}
+
+					// Check sender profile
+					if sp, exists := mem.Profile.SenderProfiles[email]; exists {
+						if sp.Importance == "high" || sp.Importance == "low" || sp.Importance == "ignore" {
+							knownSenders = append(knownSenders, map[string]interface{}{
+								"email":      email,
+								"importance": sp.Importance,
+								"type":       sp.Type,
+							})
+						}
+					}
+				}
+			}
+
+			if len(importantSenders) > 0 {
+				response["important_senders_in_list"] = importantSenders
+			}
+			if len(knownSenders) > 0 {
+				response["known_senders_in_list"] = knownSenders
+			}
+
+			// Add contextual hint
+			response["memory_hint"] = "📝 When you read an email and learn something important about a sender (e.g., user says 'this is important' or 'ignore these'), use memory_set_sender to save it."
+		}
+	}
+
+	result, err := json.Marshal(response)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
 	}
@@ -118,12 +172,125 @@ func (r *Registry) handleMessageGet(ctx context.Context, request mcp.CallToolReq
 		return mcp.NewToolResultError(fmt.Sprintf("failed to get message: %v", err)), nil
 	}
 
-	result, err := json.Marshal(message)
+	// Build enriched response
+	response := map[string]interface{}{
+		"message":    message,
+		"account_id": accountID,
+		"folder":     folder,
+	}
+
+	// Add sender context from memory - only include useful info
+	if r.memoryMgr != nil && len(message.From) > 0 {
+		senderEmail := strings.ToLower(message.From[0].Address)
+
+		mem, err := r.memoryMgr.GetOrLoad(accountID)
+		if err == nil {
+			var senderContext map[string]interface{}
+			var importance string
+
+			// Check sender profile - only include if has useful classification
+			if sp, exists := mem.Profile.SenderProfiles[senderEmail]; exists {
+				importance = sp.Importance
+				// Only include context if sender is classified
+				if sp.Importance != "" || sp.Relationship != "" || sp.Notes != "" {
+					senderContext = map[string]interface{}{
+						"importance": sp.Importance,
+					}
+					if sp.Type != "" {
+						senderContext["type"] = sp.Type
+					}
+					if sp.Relationship != "" {
+						senderContext["relationship"] = sp.Relationship
+					}
+					if sp.Notes != "" {
+						senderContext["notes"] = sp.Notes
+					}
+				}
+			}
+
+			// Check if in important contacts
+			for _, contact := range mem.ImportantContacts {
+				if strings.ToLower(contact.Email) == senderEmail {
+					if senderContext == nil {
+						senderContext = make(map[string]interface{})
+					}
+					senderContext["is_important_contact"] = true
+					senderContext["contact_role"] = contact.Role
+					importance = "high"
+					break
+				}
+			}
+
+			// Check unwanted rules
+			for _, unwanted := range mem.Unwanted.Senders {
+				if matchesPattern(unwanted, senderEmail) {
+					if senderContext == nil {
+						senderContext = make(map[string]interface{})
+					}
+					senderContext["is_unwanted"] = true
+					importance = "ignore"
+					break
+				}
+			}
+
+			if senderContext != nil {
+				response["sender_context"] = senderContext
+			}
+
+			// Add concise hint based on context
+			if importance == "high" {
+				response["memory_hint"] = "⭐ HIGH importance sender"
+			} else if importance == "ignore" {
+				response["memory_hint"] = "🔕 IGNORE sender"
+			}
+			// Don't add hints for unknown senders - saves context
+		}
+	}
+
+	result, err := json.Marshal(response)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %v", err)), nil
 	}
 
 	return mcp.NewToolResultText(string(result)), nil
+}
+
+// calculateResponseRate calculates response rate as percentage
+func calculateResponseRate(answered, seen int) float64 {
+	if seen == 0 {
+		return 0
+	}
+	return float64(answered) / float64(seen) * 100
+}
+
+// matchesPattern checks if email matches a wildcard pattern like *@domain.com
+func matchesPattern(pattern, email string) bool {
+	pattern = strings.ToLower(pattern)
+	email = strings.ToLower(email)
+
+	if !strings.Contains(pattern, "*") {
+		return pattern == email
+	}
+
+	// Handle *@domain.com pattern
+	if strings.HasPrefix(pattern, "*@") {
+		domain := pattern[2:]
+		return strings.HasSuffix(email, "@"+domain)
+	}
+
+	// Handle user@* pattern
+	if strings.HasSuffix(pattern, "@*") {
+		prefix := pattern[:len(pattern)-2]
+		return strings.HasPrefix(email, prefix+"@")
+	}
+
+	// Handle *substring* pattern
+	if strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*") {
+		substr := pattern[1 : len(pattern)-1]
+		return strings.Contains(email, substr)
+	}
+
+	return false
 }
 
 func (r *Registry) handleMessageGetHeaders(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {

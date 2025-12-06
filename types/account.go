@@ -2,6 +2,7 @@ package types
 
 // AccountConfig represents IMAP account configuration
 type AccountConfig struct {
+	// IMAP configuration
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	Host     string `json:"host"`
@@ -9,6 +10,14 @@ type AccountConfig struct {
 	TLS      bool   `json:"tls"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+
+	// SMTP configuration (optional - for sending emails)
+	SMTPHost     string `json:"smtp_host,omitempty"`
+	SMTPPort     int    `json:"smtp_port,omitempty"`     // default 587 (STARTTLS) or 465 (TLS)
+	SMTPTLS      bool   `json:"smtp_tls,omitempty"`      // use direct TLS (port 465)
+	SMTPUsername string `json:"smtp_username,omitempty"` // defaults to Username
+	SMTPPassword string `json:"smtp_password,omitempty"` // defaults to Password
+	FromAddress  string `json:"from_address,omitempty"`  // defaults to Username
 }
 
 // AccountStatus represents the connection status of an account

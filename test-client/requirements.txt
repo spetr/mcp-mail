@@ -1,0 +1,2 @@
+# MCP Test Client
+# No external dependencies - uses only Python standard library
