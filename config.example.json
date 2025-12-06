@@ -1,0 +1,53 @@
+{
+  "accounts": [
+    {
+      "id": "personal",
+      "name": "Personal Gmail",
+      "host": "imap.gmail.com",
+      "port": 993,
+      "tls": true,
+      "username": "your-email@gmail.com",
+      "password": "your-app-password"
+    },
+    {
+      "id": "work",
+      "name": "Work Email",
+      "host": "imap.company.com",
+      "port": 993,
+      "tls": true,
+      "username": "your-email@company.com",
+      "password": "your-password"
+    }
+  ],
+  "settings": {
+    "idle_timeout": 300,
+    "max_message_size": 10485760,
+    "auto_connect": false
+  },
+  "server": {
+    "transport": "stdio",
+    "host": "localhost",
+    "port": 8080,
+    "auth": {
+      "type": "bearer",
+      "token": "your-auth-token"
+    }
+  },
+  "security": {
+    "max_bulk_operations": 1000,
+    "protected_folders": ["INBOX"],
+    "trash_folder": "",
+    "read_only": false
+  },
+  "cache": {
+    "enabled": true,
+    "folder_list_ttl_sec": 300,
+    "folder_info_ttl_sec": 120,
+    "message_list_ttl_sec": 120,
+    "search_results_ttl_sec": 60,
+    "trash_folder_ttl_sec": 30,
+    "max_folder_info_entries": 100,
+    "max_message_list_entries": 50,
+    "max_search_result_entries": 20
+  }
+}
